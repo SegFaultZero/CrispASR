@@ -248,7 +248,8 @@ struct transcription_result {
 // Load audio from a multipart file upload, transcribe it, return result.
 // Acquires model_mutex internally.
 static transcription_result do_transcribe(const httplib::MultipartFormData& audio_file, CrispasrBackend* backend,
-                                          std::mutex& model_mutex, whisper_params rp, bool need_timestamps) {
+                                          crispasr_aligner_runtime* aligner_runtime, std::mutex& model_mutex,
+                                          whisper_params rp, bool need_timestamps) {
     transcription_result result;
     result.language = rp.language;
 
@@ -349,8 +350,11 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                 for (auto& seg : segs) {
                     if (!seg.words.empty() && !rp.force_aligner)
                         continue;
-                    auto words = crispasr_ctc_align(rp.aligner_model, seg.text, pcmf32.data() + sl.start,
-                                                    sl.end - sl.start, sl.t0_cs, rp.n_threads);
+                    auto words =
+                        aligner_runtime ? crispasr_ctc_align(aligner_runtime, seg.text, pcmf32.data() + sl.start,
+                                                             sl.end - sl.start, sl.t0_cs)
+                                        : crispasr_ctc_align(rp.aligner_model, seg.text, pcmf32.data() + sl.start,
+                                                             sl.end - sl.start, sl.t0_cs, rp.n_threads);
                     if (!words.empty()) {
                         seg.t0 = words.front().t0;
                         seg.t1 = words.back().t1;
@@ -395,6 +399,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
     }
 
     std::unique_ptr<CrispasrBackend> backend;
+    std::unique_ptr<crispasr_aligner_runtime, decltype(&crispasr_aligner_runtime_free)> aligner_runtime(
+        nullptr, crispasr_aligner_runtime_free);
     std::mutex model_mutex;
     std::atomic<bool> ready{false};
     std::string backend_name = params.backend;
@@ -431,6 +437,14 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         if (!backend || !backend->init(params)) {
             fprintf(stderr, "crispasr-server: failed to init backend '%s'\n", backend_name.c_str());
             return 1;
+        }
+        if (!params.aligner_model.empty()) {
+            aligner_runtime.reset(crispasr_aligner_runtime_create(params.aligner_model, params.n_threads));
+            if (!aligner_runtime) {
+                fprintf(stderr, "crispasr-server: failed to init aligner runtime '%s'\n",
+                        params.aligner_model.c_str());
+                return 1;
+            }
         }
         ready.store(true);
         fprintf(stderr, "crispasr-server: backend '%s' loaded, model '%s'\n", backend_name.c_str(),
@@ -492,7 +506,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         whisper_params rp = params;
         rp.language = form_string(req, "language", rp.language);
 
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, /*need_timestamps=*/true);
+        auto result =
+            do_transcribe(audio_file, backend.get(), aligner_runtime.get(), model_mutex, rp, /*need_timestamps=*/true);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -557,7 +572,7 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
 
         const bool need_timestamps =
             response_format == "verbose_json" || response_format == "srt" || response_format == "vtt";
-        auto result = do_transcribe(audio_file, backend.get(), model_mutex, rp, need_timestamps);
+        auto result = do_transcribe(audio_file, backend.get(), aligner_runtime.get(), model_mutex, rp, need_timestamps);
         if (!result.ok) {
             json_error(res, 400, result.error);
             return;
@@ -636,6 +651,9 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         }
 
         backend = std::move(nb);
+        aligner_runtime.reset(params.aligner_model.empty()
+                                  ? nullptr
+                                  : crispasr_aligner_runtime_create(params.aligner_model, np.n_threads));
         backend_name = new_backend;
         params.model = resolved_model;
         ready.store(true);

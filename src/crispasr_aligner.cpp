@@ -13,6 +13,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <utility>
 
 namespace {
 
@@ -82,29 +85,69 @@ bool path_contains_ci(const std::string& p, const char* needle) {
     return lo.find(needle) != std::string::npos;
 }
 
-std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, const std::vector<std::string>& words,
+} // namespace
+
+struct crispasr_aligner_runtime {
+    std::string model_path;
+    int n_threads = 4;
+    bool is_qwen3_fa = false;
+    std::mutex mutex;
+    qwen3_asr_context* ctx = nullptr;
+
+    crispasr_aligner_runtime(std::string path, int threads)
+        : model_path(std::move(path)),
+          n_threads(threads > 0 ? threads : 4),
+          is_qwen3_fa(path_contains_ci(model_path, "forced-aligner") || path_contains_ci(model_path, "qwen3-fa") ||
+                      path_contains_ci(model_path, "qwen3-forced")) {}
+
+    crispasr_aligner_runtime(const crispasr_aligner_runtime&) = delete;
+    crispasr_aligner_runtime& operator=(const crispasr_aligner_runtime&) = delete;
+
+    ~crispasr_aligner_runtime() {
+        if (ctx)
+            qwen3_asr_free(ctx);
+    }
+
+    bool ensure_loaded() {
+        if (ctx)
+            return true;
+
+        qwen3_asr_context_params cp = qwen3_asr_context_default_params();
+        cp.n_threads = n_threads;
+        cp.verbosity = 0;
+        ctx = qwen3_asr_init_from_file(model_path.c_str(), cp);
+        if (!ctx) {
+            fprintf(stderr, "crispasr[aligner-qwen3]: failed to load '%s'\n", model_path.c_str());
+            return false;
+        }
+        const int head_dim = qwen3_asr_lm_head_dim(ctx);
+        if (head_dim == 0 || head_dim > 10000) {
+            fprintf(stderr,
+                    "crispasr[aligner-qwen3]: model '%s' lm_head dim is %d "
+                    "(expected ~5000 for forced-aligner)\n",
+                    model_path.c_str(), head_dim);
+            qwen3_asr_free(ctx);
+            ctx = nullptr;
+            return false;
+        }
+        return true;
+    }
+};
+
+namespace {
+
+std::vector<CrispasrAlignedWord> align_qwen3_fa(crispasr_aligner_runtime* rt, const std::vector<std::string>& words,
                                                 const float* samples, int n_samples, int64_t t_offset_cs,
-                                                int n_threads) {
+                                                bool lock_runtime) {
     std::vector<CrispasrAlignedWord> out;
     if (words.empty())
         return out;
 
-    qwen3_asr_context_params cp = qwen3_asr_context_default_params();
-    cp.n_threads = n_threads;
-    cp.verbosity = 0;
-    qwen3_asr_context* ctx = qwen3_asr_init_from_file(model_path.c_str(), cp);
-    if (!ctx) {
-        fprintf(stderr, "crispasr[aligner-qwen3]: failed to load '%s'\n", model_path.c_str());
+    std::unique_lock<std::mutex> lock(rt->mutex, std::defer_lock);
+    if (lock_runtime)
+        lock.lock();
+    if (!rt->ensure_loaded())
         return out;
-    }
-    if (qwen3_asr_lm_head_dim(ctx) == 0 || qwen3_asr_lm_head_dim(ctx) > 10000) {
-        fprintf(stderr,
-                "crispasr[aligner-qwen3]: model '%s' lm_head dim is %d "
-                "(expected ~5000 for forced-aligner)\n",
-                model_path.c_str(), qwen3_asr_lm_head_dim(ctx));
-        qwen3_asr_free(ctx);
-        return out;
-    }
 
     std::vector<const char*> word_ptrs(words.size());
     for (size_t i = 0; i < words.size(); i++)
@@ -112,9 +155,9 @@ std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, c
 
     std::vector<int64_t> start_ms(words.size(), 0);
     std::vector<int64_t> end_ms(words.size(), 0);
-    int rc = qwen3_asr_align_words(ctx, samples, n_samples, word_ptrs.data(), (int)words.size(), start_ms.data(),
-                                   end_ms.data());
-    qwen3_asr_free(ctx);
+    int rc =
+        qwen3_asr_align_words(rt->ctx, samples, n_samples, word_ptrs.data(), (int)words.size(), start_ms.data(),
+                              end_ms.data());
     if (rc != 0) {
         fprintf(stderr, "crispasr[aligner-qwen3]: align_words rc=%d\n", rc);
         return out;
@@ -133,23 +176,10 @@ std::vector<CrispasrAlignedWord> align_qwen3_fa(const std::string& model_path, c
     return out;
 }
 
-} // namespace
-
-std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
-                                                      const float* samples, int n_samples, int64_t t_offset_cs,
-                                                      int n_threads) {
+std::vector<CrispasrAlignedWord> align_canary_ctc(const std::string& aligner_model, const std::string& transcript,
+                                                  const float* samples, int n_samples, int64_t t_offset_cs,
+                                                  int n_threads) {
     std::vector<CrispasrAlignedWord> out;
-    if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
-        return out;
-
-    const bool is_qwen3_fa = path_contains_ci(aligner_model, "forced-aligner") ||
-                             path_contains_ci(aligner_model, "qwen3-fa") ||
-                             path_contains_ci(aligner_model, "qwen3-forced");
-    if (is_qwen3_fa) {
-        const auto words = tokenise_words(transcript);
-        return align_qwen3_fa(aligner_model, words, samples, n_samples, t_offset_cs, n_threads);
-    }
-
     canary_ctc_context_params acp = canary_ctc_context_default_params();
     acp.n_threads = n_threads;
     canary_ctc_context* actx = canary_ctc_init_from_file(aligner_model.c_str(), acp);
@@ -197,4 +227,41 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
         out.push_back(std::move(cw));
     }
     return out;
+}
+
+} // namespace
+
+crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads) {
+    if (aligner_model.empty())
+        return nullptr;
+    return new crispasr_aligner_runtime(aligner_model, n_threads);
+}
+
+void crispasr_aligner_runtime_free(crispasr_aligner_runtime* rt) {
+    delete rt;
+}
+
+std::vector<CrispasrAlignedWord> crispasr_align_words_runtime(crispasr_aligner_runtime* rt,
+                                                              const std::string& transcript, const float* samples,
+                                                              int n_samples, int64_t t_offset_cs) {
+    if (!rt || transcript.empty() || !samples || n_samples <= 0)
+        return {};
+
+    if (rt->is_qwen3_fa) {
+        const auto words = tokenise_words(transcript);
+        return align_qwen3_fa(rt, words, samples, n_samples, t_offset_cs, /*lock_runtime=*/true);
+    }
+
+    return align_canary_ctc(rt->model_path, transcript, samples, n_samples, t_offset_cs, rt->n_threads);
+}
+
+std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,
+                                                      const float* samples, int n_samples, int64_t t_offset_cs,
+                                                      int n_threads) {
+    if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0)
+        return {};
+
+    std::unique_ptr<crispasr_aligner_runtime, decltype(&crispasr_aligner_runtime_free)> rt(
+        crispasr_aligner_runtime_create(aligner_model, n_threads), crispasr_aligner_runtime_free);
+    return crispasr_align_words_runtime(rt.get(), transcript, samples, n_samples, t_offset_cs);
 }

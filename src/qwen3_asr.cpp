@@ -1750,8 +1750,23 @@ extern "C" float* qwen3_asr_run_encoder(qwen3_asr_context* ctx, const float* mel
 extern "C" bool qwen3_asr_kv_init(qwen3_asr_context* ctx, int max_ctx) {
     if (!ctx || max_ctx <= 0)
         return false;
-    if (ctx->kv_k)
-        return true; // already initialized
+    if (ctx->kv_k) {
+        if (max_ctx <= ctx->kv_max_ctx)
+            return true; // already initialized with enough room
+
+        if (ctx->kv_buf) {
+            ggml_backend_buffer_free(ctx->kv_buf);
+            ctx->kv_buf = nullptr;
+        }
+        if (ctx->kv_ctx) {
+            ggml_free(ctx->kv_ctx);
+            ctx->kv_ctx = nullptr;
+        }
+        ctx->kv_k = nullptr;
+        ctx->kv_v = nullptr;
+        ctx->kv_max_ctx = 0;
+        ctx->kv_n_used = 0;
+    }
 
     const auto& hp = ctx->model.hparams;
     const int hd = (int)hp.llm_head_dim;

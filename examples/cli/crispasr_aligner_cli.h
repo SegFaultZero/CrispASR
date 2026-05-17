@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include "crispasr_aligner.h"
 #include "crispasr_backend.h"
 
 #include <string>
@@ -14,3 +15,5 @@
 
 std::vector<crispasr_word> crispasr_ctc_align(const std::string& aligner_model, const std::string& transcript,
                                               const float* samples, int n_samples, int64_t t_offset_cs, int n_threads);
+std::vector<crispasr_word> crispasr_ctc_align(crispasr_aligner_runtime* runtime, const std::string& transcript,
+                                              const float* samples, int n_samples, int64_t t_offset_cs);

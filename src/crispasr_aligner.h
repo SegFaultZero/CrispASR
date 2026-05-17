@@ -1,4 +1,4 @@
-// crispasr_aligner.h — shared CTC / forced-alignment helper.
+// crispasr_aligner.h - shared CTC / forced-alignment helper.
 //
 // LLM-based backends (qwen3, voxtral, voxtral4b, granite) emit plain text
 // without per-word timestamps. A second pass through a CTC aligner
@@ -34,12 +34,30 @@ struct CrispasrAlignedWord {
     int64_t t1_cs = 0;
 };
 
-/// Run CTC forced alignment.
+struct crispasr_aligner_runtime;
+
+/// Create a reusable aligner runtime.
+///
+/// For Qwen3 forced alignment this keeps the model context loaded until
+/// `crispasr_aligner_runtime_free()`. For canary CTC this stores the
+/// selected model path but still loads per alignment call.
+crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads);
+void crispasr_aligner_runtime_free(crispasr_aligner_runtime* rt);
+
+/// Run forced alignment through a reusable runtime.
+///
+/// Returns an empty vector on any failure (error printed to stderr).
+std::vector<CrispasrAlignedWord> crispasr_align_words_runtime(crispasr_aligner_runtime* rt,
+                                                              const std::string& transcript, const float* samples,
+                                                              int n_samples, int64_t t_offset_cs);
+
+/// Run CTC forced alignment as a one-shot call.
 ///
 /// Dispatches to canary-ctc-aligner by default and to qwen3-fa when
 /// `aligner_model` filename contains "forced-aligner" / "qwen3-fa" /
-/// "qwen3-forced". Both model types load and free inside the call —
-/// cost is dominated by the ASR pass upstream, not the aligner load.
+/// "qwen3-forced". Both model types load and free inside the call. Long-
+/// lived callers that want Qwen3 forced-aligner reuse should own a
+/// `crispasr_aligner_runtime` and call `crispasr_align_words_runtime()`.
 ///
 /// Returns an empty vector on any failure (error printed to stderr).
 std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner_model, const std::string& transcript,

@@ -41,8 +41,21 @@ struct crispasr_aligner_runtime;
 /// For Qwen3 forced alignment this keeps the model context loaded until
 /// `crispasr_aligner_runtime_free()`. For canary CTC this stores the
 /// selected model path but still loads per alignment call.
-crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads);
+crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads,
+                                                          bool use_gpu = true);
 void crispasr_aligner_runtime_free(crispasr_aligner_runtime* rt);
+
+/// Return true when there is no async load to perform.
+///
+/// Qwen3 forced alignment becomes ready after its persistent model context has
+/// loaded successfully. Canary CTC is always ready because it remains per-call.
+bool crispasr_aligner_runtime_is_ready(const crispasr_aligner_runtime* rt);
+
+/// Start loading a reusable runtime in the background.
+///
+/// This is useful for Qwen3 forced alignment, where model load includes the
+/// GPU upload. Canary CTC currently remains a per-call load and this is a no-op.
+void crispasr_aligner_runtime_prepare_async(crispasr_aligner_runtime* rt);
 
 /// Run forced alignment through a reusable runtime.
 ///

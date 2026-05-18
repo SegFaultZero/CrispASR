@@ -9,10 +9,13 @@
 #include "canary_ctc.h"
 #include "qwen3_asr.h"
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <utility>
@@ -90,13 +93,18 @@ bool path_contains_ci(const std::string& p, const char* needle) {
 struct crispasr_aligner_runtime {
     std::string model_path;
     int n_threads = 4;
+    bool use_gpu = true;
     bool is_qwen3_fa = false;
     std::mutex mutex;
+    std::mutex prepare_mutex;
+    std::shared_future<bool> prepare_future;
+    std::atomic<bool> ready{false};
     qwen3_asr_context* ctx = nullptr;
 
-    crispasr_aligner_runtime(std::string path, int threads)
+    crispasr_aligner_runtime(std::string path, int threads, bool gpu)
         : model_path(std::move(path)),
           n_threads(threads > 0 ? threads : 4),
+          use_gpu(gpu),
           is_qwen3_fa(path_contains_ci(model_path, "forced-aligner") || path_contains_ci(model_path, "qwen3-fa") ||
                       path_contains_ci(model_path, "qwen3-forced")) {}
 
@@ -104,6 +112,15 @@ struct crispasr_aligner_runtime {
     crispasr_aligner_runtime& operator=(const crispasr_aligner_runtime&) = delete;
 
     ~crispasr_aligner_runtime() {
+        std::shared_future<bool> future;
+        {
+            std::lock_guard<std::mutex> lock(prepare_mutex);
+            future = prepare_future;
+        }
+        if (future.valid())
+            future.wait();
+
+        std::lock_guard<std::mutex> lock(mutex);
         if (ctx)
             qwen3_asr_free(ctx);
     }
@@ -112,9 +129,14 @@ struct crispasr_aligner_runtime {
         if (ctx)
             return true;
 
+        const auto load_start = std::chrono::steady_clock::now();
+        fprintf(stderr, "crispasr[aligner-qwen3]: loading '%s' (%s)\n", model_path.c_str(),
+                use_gpu ? "gpu" : "cpu");
+
         qwen3_asr_context_params cp = qwen3_asr_context_default_params();
         cp.n_threads = n_threads;
         cp.verbosity = 0;
+        cp.use_gpu = use_gpu;
         ctx = qwen3_asr_init_from_file(model_path.c_str(), cp);
         if (!ctx) {
             fprintf(stderr, "crispasr[aligner-qwen3]: failed to load '%s'\n", model_path.c_str());
@@ -130,7 +152,55 @@ struct crispasr_aligner_runtime {
             ctx = nullptr;
             return false;
         }
+        ready.store(true, std::memory_order_release);
+        const auto load_end = std::chrono::steady_clock::now();
+        const double load_s = std::chrono::duration<double>(load_end - load_start).count();
+        fprintf(stderr, "crispasr[aligner-qwen3]: loaded '%s' (%s, %.2fs)\n", model_path.c_str(),
+                use_gpu ? "gpu" : "cpu", load_s);
         return true;
+    }
+
+    void prepare_async() {
+        if (!is_qwen3_fa)
+            return;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (ctx)
+                return;
+        }
+
+        std::lock_guard<std::mutex> lock(prepare_mutex);
+        if (prepare_future.valid())
+            return;
+
+        fprintf(stderr, "crispasr[aligner-qwen3]: async load requested\n");
+        prepare_future = std::async(std::launch::async, [this]() {
+                             std::lock_guard<std::mutex> load_lock(mutex);
+                             return ensure_loaded();
+                         }).share();
+    }
+
+    bool wait_ready() {
+        if (!is_qwen3_fa)
+            return true;
+
+        std::shared_future<bool> future;
+        {
+            std::lock_guard<std::mutex> lock(prepare_mutex);
+            future = prepare_future;
+        }
+        if (future.valid()) {
+            const bool ok = future.get();
+            if (!ok) {
+                std::lock_guard<std::mutex> lock(prepare_mutex);
+                prepare_future = {};
+            }
+            return ok;
+        }
+
+        std::lock_guard<std::mutex> lock(mutex);
+        return ensure_loaded();
     }
 };
 
@@ -231,14 +301,28 @@ std::vector<CrispasrAlignedWord> align_canary_ctc(const std::string& aligner_mod
 
 } // namespace
 
-crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads) {
+crispasr_aligner_runtime* crispasr_aligner_runtime_create(const std::string& aligner_model, int n_threads,
+                                                          bool use_gpu) {
     if (aligner_model.empty())
         return nullptr;
-    return new crispasr_aligner_runtime(aligner_model, n_threads);
+    return new crispasr_aligner_runtime(aligner_model, n_threads, use_gpu);
 }
 
 void crispasr_aligner_runtime_free(crispasr_aligner_runtime* rt) {
     delete rt;
+}
+
+bool crispasr_aligner_runtime_is_ready(const crispasr_aligner_runtime* rt) {
+    if (!rt)
+        return false;
+    if (!rt->is_qwen3_fa)
+        return true;
+    return rt->ready.load(std::memory_order_acquire);
+}
+
+void crispasr_aligner_runtime_prepare_async(crispasr_aligner_runtime* rt) {
+    if (rt)
+        rt->prepare_async();
 }
 
 std::vector<CrispasrAlignedWord> crispasr_align_words_runtime(crispasr_aligner_runtime* rt,
@@ -248,6 +332,9 @@ std::vector<CrispasrAlignedWord> crispasr_align_words_runtime(crispasr_aligner_r
         return {};
 
     if (rt->is_qwen3_fa) {
+        if (!rt->wait_ready())
+            return {};
+
         const auto words = tokenise_words(transcript);
         return align_qwen3_fa(rt, words, samples, n_samples, t_offset_cs, /*lock_runtime=*/true);
     }

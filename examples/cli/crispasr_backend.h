@@ -14,6 +14,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -112,6 +113,10 @@ public:
     // offset).
     virtual std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                                      const whisper_params& params) = 0;
+
+    // Optional request-scoped hook fired by backends once inference has
+    // started. Servers can use this to overlap dependent lazy work.
+    virtual void set_inference_started_callback(std::function<void()> cb) { (void)cb; }
 
     // Optional stereo-aware overload for backends that can split stereo
     // channels for diarization (currently: whisper). Default

@@ -19,6 +19,7 @@
 // Adapted from examples/server/server.cpp for multi-backend support.
 
 #include "crispasr_backend.h"
+#include "crispasr_backend_utils.h"
 #include "crispasr_lid.h"
 #include "crispasr_lid_cli.h"
 #include "crispasr_output.h"
@@ -341,6 +342,23 @@ static transcription_result do_transcribe(const httplib::MultipartFormData& audi
                     rp.force_aligner ? 1 : 0, want_align ? 1 : 0);
         }
 
+        bool align_prepare_started = false;
+        if (want_align && aligner_runtime && !crispasr_aligner_runtime_is_ready(aligner_runtime)) {
+            backend->set_inference_started_callback([aligner_runtime, &align_prepare_started]() {
+                if (align_prepare_started)
+                    return;
+                align_prepare_started = true;
+                crispasr_aligner_runtime_prepare_async(aligner_runtime);
+            });
+        }
+        struct InferenceCallbackGuard {
+            CrispasrBackend* backend = nullptr;
+            ~InferenceCallbackGuard() {
+                if (backend)
+                    backend->set_inference_started_callback({});
+            }
+        } inference_callback_guard{backend};
+
         for (size_t i = 0; i < slices.size(); ++i) {
             const auto& sl = slices[i];
             auto tc0 = std::chrono::steady_clock::now();
@@ -439,7 +457,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
             return 1;
         }
         if (!params.aligner_model.empty()) {
-            aligner_runtime.reset(crispasr_aligner_runtime_create(params.aligner_model, params.n_threads));
+            aligner_runtime.reset(crispasr_aligner_runtime_create(params.aligner_model, params.n_threads,
+                                                                  crispasr_backend_should_use_gpu(params)));
             if (!aligner_runtime) {
                 fprintf(stderr, "crispasr-server: failed to init aligner runtime '%s'\n",
                         params.aligner_model.c_str());
@@ -653,7 +672,8 @@ int crispasr_run_server(whisper_params& params, const std::string& host, int por
         backend = std::move(nb);
         aligner_runtime.reset(params.aligner_model.empty()
                                   ? nullptr
-                                  : crispasr_aligner_runtime_create(params.aligner_model, np.n_threads));
+                                  : crispasr_aligner_runtime_create(params.aligner_model, np.n_threads,
+                                                                    crispasr_backend_should_use_gpu(np)));
         backend_name = new_backend;
         params.model = resolved_model;
         ready.store(true);

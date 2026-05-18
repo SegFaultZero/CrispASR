@@ -24,8 +24,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -142,6 +144,10 @@ public:
         return true;
     }
 
+    void set_inference_started_callback(std::function<void()> cb) override {
+        inference_started_callback_ = std::move(cb);
+    }
+
     std::vector<crispasr_segment> transcribe(const float* samples, int n_samples, int64_t t_offset_cs,
                                              const whisper_params& params) override {
         std::vector<crispasr_segment> out;
@@ -156,7 +162,6 @@ public:
             return out;
         }
 
-        // ---- Encoder ----
         int N_enc = 0, pdim = 0;
         float* audio_embeds = qwen3_asr_run_encoder(ctx_, mel, n_mels, T_mel, &N_enc, &pdim);
         free(mel);
@@ -164,6 +169,8 @@ public:
             fprintf(stderr, "crispasr[qwen3]: encoder failed\n");
             return out;
         }
+        if (inference_started_callback_)
+            inference_started_callback_();
 
         // ---- ChatML prompt: <|im_start|>system\n[SYS]<|im_end|>\n
         //                     <|im_start|>user\n<|audio_start|>
@@ -570,6 +577,7 @@ public:
 
 private:
     qwen3_asr_context* ctx_ = nullptr;
+    std::function<void()> inference_started_callback_;
 };
 
 } // namespace

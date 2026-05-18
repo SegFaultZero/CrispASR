@@ -663,6 +663,118 @@ bool load_weights(const char* path, ggml_backend_t backend, const char* model_ta
     return true;
 }
 
+bool load_weights_filtered(const char* path, ggml_backend_t backend, TensorFilter include_tensor, void* user,
+                           const char* model_tag, WeightLoad& out) {
+    const char* tag = model_tag ? model_tag : "core_gguf";
+    if (!backend) {
+        fprintf(stderr, "%s: load_weights_filtered requires a backend\n", tag);
+        return false;
+    }
+    if (!include_tensor) {
+        fprintf(stderr, "%s: load_weights_filtered requires a tensor filter\n", tag);
+        return false;
+    }
+
+    gguf_init_params gp = {/*.no_alloc=*/true, /*.ctx=*/&out.ctx};
+    gguf_context* gctx = gguf_init_from_file(path, gp);
+    if (!gctx || !out.ctx) {
+        fprintf(stderr, "%s: failed to load tensor metadata from '%s'\n", tag, path);
+        if (gctx)
+            gguf_free(gctx);
+        return false;
+    }
+
+    std::vector<ggml_tensor*> selected;
+    size_t selected_size = 0;
+    for (ggml_tensor* t = ggml_get_first_tensor(out.ctx); t; t = ggml_get_next_tensor(out.ctx, t)) {
+        const char* tname = ggml_get_name(t);
+        if (!include_tensor(tname, user))
+            continue;
+        selected.push_back(t);
+        selected_size += ggml_nbytes(t);
+        out.tensors[tname] = t;
+    }
+
+    if (selected.empty()) {
+        fprintf(stderr, "%s: no tensors selected from '%s'\n", tag, path);
+        gguf_free(gctx);
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        return false;
+    }
+
+    auto round_up = [](size_t n, size_t a) { return (n + a - 1) & ~(a - 1); };
+    const size_t align = ggml_backend_get_alignment(backend);
+    size_t aligned_total = 0;
+    for (ggml_tensor* t : selected)
+        aligned_total = round_up(aligned_total, align) + ggml_nbytes(t);
+
+    out.buf = ggml_backend_alloc_buffer(backend, aligned_total);
+    if (!out.buf) {
+        fprintf(stderr, "%s: failed to allocate %zu MiB filtered backend buffer\n", tag, aligned_total / 1048576);
+        gguf_free(gctx);
+        ggml_free(out.ctx);
+        out.ctx = nullptr;
+        out.tensors.clear();
+        return false;
+    }
+
+    char* base = (char*)ggml_backend_buffer_get_base(out.buf);
+    size_t cursor = 0;
+    for (ggml_tensor* t : selected) {
+        cursor = round_up(cursor, align);
+        ggml_backend_tensor_alloc(out.buf, t, base + cursor);
+        cursor += ggml_nbytes(t);
+    }
+
+    MappedFile mf(path);
+    if (!mf.ok) {
+        FILE* fp = fopen(path, "rb");
+        if (!fp) {
+            fprintf(stderr, "%s: cannot open '%s' for fread fallback\n", tag, path);
+            free_weights(out);
+            gguf_free(gctx);
+            return false;
+        }
+        const size_t data_off = gguf_get_data_offset(gctx);
+        std::vector<uint8_t> tbuf;
+        for (ggml_tensor* t : selected) {
+            const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+            if (tid < 0)
+                continue;
+            const size_t off = gguf_get_tensor_offset(gctx, tid);
+            const size_t nbytes = ggml_nbytes(t);
+            if (tbuf.size() < nbytes)
+                tbuf.resize(nbytes);
+#if defined(_WIN32)
+            if (_fseeki64(fp, (int64_t)(data_off + off), SEEK_SET) != 0)
+                break;
+#else
+            if (fseeko(fp, (off_t)(data_off + off), SEEK_SET) != 0)
+                break;
+#endif
+            if (fread(tbuf.data(), 1, nbytes, fp) != nbytes)
+                break;
+            ggml_backend_tensor_set(t, tbuf.data(), 0, nbytes);
+        }
+        fclose(fp);
+    } else {
+        const size_t data_off = gguf_get_data_offset(gctx);
+        for (ggml_tensor* t : selected) {
+            const int64_t tid = gguf_find_tensor(gctx, ggml_get_name(t));
+            if (tid < 0)
+                continue;
+            const size_t off = gguf_get_tensor_offset(gctx, tid);
+            const size_t nbytes = ggml_nbytes(t);
+            ggml_backend_tensor_set(t, (const char*)mf.base + data_off + off, 0, nbytes);
+        }
+    }
+
+    fprintf(stderr, "%s: filtered weights: %zu MiB (%zu tensors)\n", tag, selected_size / 1048576, selected.size());
+    gguf_free(gctx);
+    return true;
+}
+
 void free_weights(WeightLoad& wl) {
     if (wl.buf) {
         ggml_backend_buffer_free(wl.buf);

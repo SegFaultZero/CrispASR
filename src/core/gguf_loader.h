@@ -104,6 +104,14 @@ struct WeightLoad {
 // model_tag is used only in error messages ("parakeet: ...").
 bool load_weights(const char* path, ggml_backend_t backend, const char* model_tag, WeightLoad& out);
 
+// Load only tensors accepted by `include_tensor`. This is for sub-runtimes
+// embedded in a larger GGUF, e.g. crisp_audio loading only `audio.*` tensors
+// from a Qwen3-ASR file. Unselected tensors remain in the GGML metadata
+// context but are not allocated, uploaded, or exposed in `out.tensors`.
+using TensorFilter = bool (*)(const char* tensor_name, void* user);
+bool load_weights_filtered(const char* path, ggml_backend_t backend, TensorFilter include_tensor, void* user,
+                           const char* model_tag, WeightLoad& out);
+
 // PLAN #69a: layer-residency-aware weight loader. Tensors for which
 // `is_gpu(tensor_name, user) == true` go on the GPU backend; the rest
 // go on the CPU backend. ggml_backend_sched then auto-routes ops to

@@ -212,6 +212,15 @@ const char* default_or(const char* p, const char* d) {
     return (p && *p) ? p : d;
 }
 
+struct TensorPrefixFilter {
+    const std::string* prefix = nullptr;
+};
+
+bool tensor_has_prefix(const char* name, void* user) {
+    const auto* filter = static_cast<const TensorPrefixFilter*>(user);
+    return filter && filter->prefix && name && std::strncmp(name, filter->prefix->c_str(), filter->prefix->size()) == 0;
+}
+
 // ---------------------------------------------------------------------------
 // Model loading — pull weights + hparams from the GGUF.
 // ---------------------------------------------------------------------------
@@ -274,7 +283,8 @@ bool load_model(crisp_audio_context& ctx, const char* path, const crisp_audio_pa
 
     // ---- pass 2: weights via shared loader ----
     core_gguf::WeightLoad wl;
-    if (!core_gguf::load_weights(path, ctx.backend, "crisp_audio", wl)) {
+    TensorPrefixFilter filter{&tprefix};
+    if (!core_gguf::load_weights_filtered(path, ctx.backend, tensor_has_prefix, &filter, "crisp_audio", wl)) {
         return false;
     }
     ctx.model_ctx = wl.ctx;
